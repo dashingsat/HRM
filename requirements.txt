@@ -1,4 +1,5 @@
 torch
+numpy
 adam-atan2
 einops
 tqdm
