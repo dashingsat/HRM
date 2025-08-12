@@ -4,11 +4,31 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+# Try FlashAttention imports with robust fallbacks. If unavailable (e.g., due to GLIBC issues),
+# fall back to PyTorch's scaled_dot_product_attention implementation.
 try:
     from flash_attn_interface import flash_attn_func  # type: ignore[import]
-except ImportError:
-    # Fallback to FlashAttention 2
-    from flash_attn import flash_attn_func  # type: ignore[import]
+except Exception:
+    try:
+        # Fallback to FlashAttention 2
+        from flash_attn import flash_attn_func  # type: ignore[import]
+    except Exception:
+        def flash_attn_func(*, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False):
+            """Minimal drop-in fallback using PyTorch SDPA.
+
+            Expects q, k, v with shape [batch, seq_len, num_heads, head_dim].
+            Returns tensor with shape [batch, num_heads, seq_len, head_dim].
+            """
+            # Transform to [batch, num_heads, seq_len, head_dim]
+            q_bh = q.transpose(1, 2)
+            k_bh = k.transpose(1, 2)
+            v_bh = v.transpose(1, 2)
+
+            # Use PyTorch fused attention
+            attn_bh = F.scaled_dot_product_attention(
+                q_bh, k_bh, v_bh, attn_mask=None, dropout_p=0.0, is_causal=causal
+            )
+            return attn_bh
 
 from models.common import trunc_normal_init_
 
@@ -88,8 +108,8 @@ class RotaryEmbedding(nn.Module):
 
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_cached = nn.Buffer(emb.cos(), persistent=False)
-        self.sin_cached = nn.Buffer(emb.sin(), persistent=False)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
     def forward(self):
         return self.cos_cached, self.sin_cached
@@ -131,7 +151,15 @@ class Attention(nn.Module):
         if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
             attn_output = attn_output[0]
 
-        # attn_output: [batch_size, num_heads, seq_len, head_dim]
+        # Ensure layout is [batch_size, seq_len, num_heads, head_dim] before merging heads
+        # Some implementations return [B, H, S, D] while others return [B, S, H, D].
+        if attn_output.dim() == 4 and attn_output.shape[1] == seq_len:
+            # [B, S, H, D]
+            attn_output = attn_output.contiguous()
+        else:
+            # Assume [B, H, S, D]
+            attn_output = attn_output.transpose(1, 2).contiguous()
+
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
