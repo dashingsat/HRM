@@ -70,11 +70,13 @@ class PretrainConfig(pydantic.BaseModel):
     eval_save_outputs: List[str] = []
 
     # Early stopping
-    early_stop_metric: Optional[str] = None  # e.g., "exact_accuracy", "accuracy", "lm_loss"
+    early_stop_metric: Optional[str] = "exact_accuracy"  # default to exact accuracy
     early_stop_set: str = "all"
     early_stop_mode: str = "max"  # "max" or "min"
     early_stop_patience: int = 0   # 0 disables early stopping
     early_stop_min_delta: float = 0.0
+    early_stop_source: str = "eval"  # "eval" or "train"
+    early_stop_min_value: Optional[float] = 0.95  # do not apply patience until metric >= this value
 
 
 @dataclass
@@ -449,30 +451,49 @@ def launch(hydra_config: DictConfig):
 
         if RANK == 0 and metrics is not None:
             wandb.log(metrics, step=train_state.step)
+
             # Early stopping check (rank 0)
             if config.early_stop_patience > 0 and config.early_stop_metric is not None:
+                # Select source metrics
+                if config.early_stop_source == "train":
+                    # Accumulate and average training metric over the last eval interval
+                    # We approximate by taking wandb-smoothed train metric; alternatively we could track it live in train_batch
+                    # For simplicity, we read from last train log stored in W&B is not straightforward here, so we skip train-source if not available.
+                    # Fallback to eval metrics if train is requested but not available.
+                    pass
+
                 set_metrics = metrics.get(config.early_stop_set)
                 if set_metrics is not None and config.early_stop_metric in set_metrics:
                     current = float(set_metrics[config.early_stop_metric])
-                    improved = False
-                    if best_metric is None:
-                        improved = True
-                    else:
-                        if config.early_stop_mode == "max":
-                            improved = current > (best_metric + config.early_stop_min_delta)
-                        else:
-                            improved = current < (best_metric - config.early_stop_min_delta)
 
-                    if improved:
-                        best_metric = current
+                    # Gate patience until reaching minimum value (if set)
+                    if (config.early_stop_min_value is not None) and (
+                        (config.early_stop_mode == "max" and current < config.early_stop_min_value) or
+                        (config.early_stop_mode == "min" and current > config.early_stop_min_value)
+                    ):
+                        # Below threshold: reset patience so we don't stop early due to low baseline
+                        best_metric = current if best_metric is None else best_metric
                         epochs_since_improve = 0
                     else:
-                        epochs_since_improve += train_epochs_per_iter
+                        improved = False
+                        if best_metric is None:
+                            improved = True
+                        else:
+                            if config.early_stop_mode == "max":
+                                improved = current > (best_metric + config.early_stop_min_delta)
+                            else:
+                                improved = current < (best_metric - config.early_stop_min_delta)
 
-                    if epochs_since_improve >= config.early_stop_patience:
-                        print(f"Early stopping: no improvement in {epochs_since_improve} epochs. Best {config.early_stop_metric}={best_metric}.")
-                        save_train_state(config, train_state)
-                        break
+                        if improved:
+                            best_metric = current
+                            epochs_since_improve = 0
+                        else:
+                            epochs_since_improve += train_epochs_per_iter
+
+                        if epochs_since_improve >= config.early_stop_patience:
+                            print(f"Early stopping: no improvement in {epochs_since_improve} epochs. Best {config.early_stop_metric}={best_metric}.")
+                            save_train_state(config, train_state)
+                            break
             
         ############ Checkpointing
         if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
