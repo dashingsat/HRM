@@ -69,6 +69,13 @@ class PretrainConfig(pydantic.BaseModel):
     eval_interval: Optional[int] = None
     eval_save_outputs: List[str] = []
 
+    # Early stopping
+    early_stop_metric: Optional[str] = None  # e.g., "exact_accuracy", "accuracy", "lm_loss"
+    early_stop_set: str = "all"
+    early_stop_mode: str = "max"  # "max" or "min"
+    early_stop_patience: int = 0   # 0 disables early stopping
+    early_stop_min_delta: float = 0.0
+
 
 @dataclass
 class TrainState:
@@ -419,6 +426,10 @@ def launch(hydra_config: DictConfig):
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
 
+    # Early stop state
+    best_metric = None
+    epochs_since_improve = 0
+
     # Training Loop
     for _iter_id in range(total_iters):
         print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
@@ -438,6 +449,30 @@ def launch(hydra_config: DictConfig):
 
         if RANK == 0 and metrics is not None:
             wandb.log(metrics, step=train_state.step)
+            # Early stopping check (rank 0)
+            if config.early_stop_patience > 0 and config.early_stop_metric is not None:
+                set_metrics = metrics.get(config.early_stop_set)
+                if set_metrics is not None and config.early_stop_metric in set_metrics:
+                    current = float(set_metrics[config.early_stop_metric])
+                    improved = False
+                    if best_metric is None:
+                        improved = True
+                    else:
+                        if config.early_stop_mode == "max":
+                            improved = current > (best_metric + config.early_stop_min_delta)
+                        else:
+                            improved = current < (best_metric - config.early_stop_min_delta)
+
+                    if improved:
+                        best_metric = current
+                        epochs_since_improve = 0
+                    else:
+                        epochs_since_improve += train_epochs_per_iter
+
+                    if epochs_since_improve >= config.early_stop_patience:
+                        print(f"Early stopping: no improvement in {epochs_since_improve} epochs. Best {config.early_stop_metric}={best_metric}.")
+                        save_train_state(config, train_state)
+                        break
             
         ############ Checkpointing
         if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
