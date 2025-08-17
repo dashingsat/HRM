@@ -116,6 +116,61 @@ Explore the puzzles visually:
 
 ## Launch experiments
 
+### Odd/Even Sudoku (custom experiment)
+
+This repo includes a variant task where inputs contain parity hints (Odd/Even) at some blank cells, while labels remain the solved digits. We trained this on a single H100 (Hopper) GPU using FlashAttention 3 and achieved strong generalization.
+
+#### Build the dataset
+
+```bash
+# ~1K puzzles × 800 augmentations ≈ 801k training examples
+python dataset/build_sudoku_odd_even_dataset.py \
+  --output-dir data/sudoku-odd-even-1k-aug-800 \
+  --subsample-size 1000 \
+  --num-aug 800 \
+  --hint-fraction 0.35
+
+# (optional) Validate parity consistency and coverage
+python scripts/validate_odd_even_dataset.py --data-path data/sudoku-odd-even-1k-aug-800 --max-samples 100000
+
+# (optional) Inspect a sample
+python scripts/show_odd_even_sample.py --data-path data/sudoku-odd-even-1k-aug-800 --split train --index 0
+```
+
+#### Train (single GPU)
+
+```bash
+OMP_NUM_THREADS=16 python pretrain.py -cn cfg_pretrain_odd_even \
+  data_path=data/sudoku-odd-even-1k-aug-800 \
+  epochs=20000 eval_interval=2000 \
+  lr=7e-5 lr_min_ratio=0.1 \
+  weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
+  arch.L_cycles=6 arch.halt_max_steps=12 \
+  early_stop_patience=4000 early_stop_min_delta=0.001
+```
+
+Notes:
+- Hardware: 1× H100 (Hopper, sm_90), CUDA 12.6, FlashAttention 3.
+- Early stopping monitors eval `exact_accuracy` (default), starts after it reaches 0.95, and stops if no improvement across two evals (with the above settings).
+
+#### Evaluate and infer
+
+```bash
+# Evaluate the best checkpoint
+python evaluate.py checkpoint=<CHECKPOINT_PATH>
+
+# One-off inference on a custom puzzle (digits 0-9, '.' or '0' for blank, 'O'/'E' for parity hints)
+python scripts/infer_odd_even.py \
+  --checkpoint <CHECKPOINT_PATH> \
+  --grid-file /absolute/path/to/grid.txt \
+  --L-cycles 8 --halt-max-steps 24 --avg-logits
+```
+
+#### Results (our run)
+- Token accuracy (eval): ~0.99
+- Exact accuracy (eval): 0.9881 (with `arch.L_cycles=6`, `arch.halt_max_steps=12`)
+- We observed the expected late-stage instability after the training `exact_accuracy` reached ~1.0; using early stopping preserves the best checkpoint near the peak.
+
 ### Small-sample (1K)
 
 ARC-1:
